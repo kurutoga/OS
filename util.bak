@@ -1,0 +1,497 @@
+#include "type.h"
+
+GD    *gp;
+SUPER *sp;
+INODE *ip;
+DIR   *dp; 
+char  *cp;
+MINODE *root;
+MINODE minode[NMINODES];
+MOUNT mount[NMOUNT];
+PROC *running;
+PROC P[NPROC];
+OFT ftable[NOFT];
+char sbuf[1024];
+char gbuf[1024];
+
+//block methods
+
+int get_block(int fd, int blk, char buf[]) {
+    lseek64(fd, (long long)blk*BLKSIZE(sp), 0);
+    read(fd, buf, BLKSIZE(sp));
+}
+
+int put_block(int fd, int blk, char buf[]) {
+    lseek64(fd, (long long)blk*BLKSIZE(sp), 0);
+    write(fd, buf, BLKSIZE(sp));
+}
+
+//super capture methods
+superb(int fd) {
+    lseek(fd, OFFSET, 0);
+    read(fd,sbuf, sizeof(SUPER));
+    sp=(SUPER *)sbuf;
+}
+
+super(int fd) {
+    lseek(fd, OFFSET, 0);
+    read(fd, sbuf, sizeof(SUPER));
+    sp=(SUPER *)sbuf;
+
+    printf("DEVICE MAGIC = %x\n", sp->s_magic);
+    if (sp->s_magic != 0xEF53) {
+        printf("Non-EXT2 Disk! Terminating..\n");
+        sp=0;
+        return;
+    }
+
+    printf("Total Inodes: \t\t%d\n", sp->s_inodes_count);
+    printf("Total Blocks: \t\t%d\n", sp->s_blocks_count);
+
+    printf("Free Inodes: \t\t%d\n", sp->s_free_inodes_count);
+    printf("Free Blocks: \t\t%d\n", sp->s_free_blocks_count);
+    printf("First Data Block: \t\t%d\n", sp->s_first_data_block);
+
+    printf("Block Size: \t\t%d\n", BLKSIZE(sp));
+   // printf("Log Frag Size: \t\t%d\n", sp->s_log_frag_size);
+    printf("Blocks/Group: \t\t%d\n", BLOCKS_PER_GRP(sp));
+   // printf("Frags/Group: \t\t%d\n", sp->s_frags_per_group);
+    printf("Inodes/Group: \t\t%d\n", INODES_PER_GRP(sp));
+
+    printf("Mount Count: \t\t%d\n", sp->s_mnt_count);
+    printf("Max Mount Count: \t\t%d\n", sp->s_max_mnt_count);
+
+    printf("s_mtime: %s\n", ctime((const time_t *)&sp->s_mtime));
+    printf("s_wtime: %s\n", ctime((const time_t *)&sp->s_wtime));
+}
+
+//group 0 method
+group(int fd, int gno) {
+
+    int gblock, goffset;
+    if (BLKSIZE(sp)==OFFSET)
+        gblock=(2+gno/(BLKSIZE(sp)/sizeof(GD)));
+    else
+        gblock=(1+gno/(BLKSIZE(sp)/sizeof(GD)));
+    goffset=gno%(BLKSIZE(sp)/sizeof(GD));
+    get_block(fd, gblock, gbuf);
+    gp=(GD *)gbuf;
+//    printf("BLOCK BITMAP AT : \t\t%d\n", gp->bg_block_bitmap);
+//    printf("INODE BITMAP AT : \t\t%d\n", gp->bg_inode_bitmap);
+
+//    printf("INODE TABLE AT : \t\t%d\n", INODE_TABLE(gp));
+//    printf("FREE BLOCKS COUNT : \t\t%d\n", gp->bg_free_blocks_count);
+//    printf("FREE INODES COUNT : \t\t%d\n", gp->bg_free_inodes_count);
+//    printf("USED DIRS COUNT : \t\t%d\n", gp->bg_used_dirs_count);
+}
+
+//root inode method
+inoded(int fd, int ino, INODE *it) {
+    int grp, gino;
+    superb(fd);
+    if (ino<sp->s_inodes_per_group) {
+        grp=0;
+        gino=ino-1;
+    } else {
+        grp=(int)((ino-1)/sp->s_inodes_per_group);
+        gino=(ino-1)%sp->s_inodes_per_group;
+    }
+    group(fd, grp);
+    lseek64(fd, (long long)gp->bg_inode_table*BLKSIZE(sp)+(long long)gino*INODESIZE(sp), 0);
+    read(fd, it, sizeof(INODE));
+
+}
+
+write_super_group(int dev, int gno, char *sup, char *gro) {
+
+    int gblock, goffset;
+    lseek(dev, OFFSET, 0);
+    write(dev, sup, sizeof(SUPER));
+    if (BLKSIZE(sp)==OFFSET)
+        gblock=(2+gno/(BLKSIZE(sp)/sizeof(GD)));
+    else
+        gblock=(1+gno/(BLKSIZE(sp)/sizeof(GD)));
+    goffset=gno%(BLKSIZE(sp)/sizeof(GD));
+    lseek(dev, gblock*BLKSIZE(sp)+goffset*sizeof(GD), 0);
+    write(dev, gro, sizeof(GD));
+
+}
+
+int decFreeInodes(int dev, int gno) {
+  // dec free inodes count in SUPER and GD
+  sp->s_free_inodes_count-=1;
+  gp->bg_free_inodes_count-=1;
+  write_super_group(dev, gno, (char *)sp, (char *)gp);
+
+}
+
+int incFreeInodes(int dev, int gno) {
+    // increase free inodes count in SUPER and current GD
+    sp->s_free_inodes_count+=1;
+    gp->bg_free_inodes_count+=1;
+    write_super_group(dev, gno, (char *)sp, (char *)gp);
+}
+
+int decFreeBlocks(int dev, int gno) {
+    // decrease free blocks count in SUPER and GD
+    sp->s_free_blocks_count-=1;
+    gp->bg_free_blocks_count-=1;
+    write_super_group(dev, gno, (char *)sp, (char *)gp);
+}
+
+int incFreeBlocks(int dev, int gno) {
+    // increase free blocks count in SUPER and GD
+    sp->s_free_blocks_count+=1;
+    gp->bg_free_blocks_count+=1;
+    write_super_group(dev, gno, (char *)sp, (char *)gp);
+}
+
+int ialloc(int dev) {
+  int  i,gno=0;
+  char *buffer;
+  buffer=malloc(BLKSIZE(sp)+1);
+
+  for(gno=0;gno<(sp->s_inodes_count)/(sp->s_inodes_per_group);gno++) {
+    // read inode_bitmap block
+    get_block(dev, IMAP(gp), buffer);
+
+    for (i=0; i < INODES_PER_GRP(sp); i++) {
+        if (!TST_BIT(buffer,i)) {
+            SET_BIT(buffer,i);
+            decFreeInodes(dev, gno);
+
+            put_block(dev, IMAP(gp), buffer);
+            free(buffer);
+            return i+1;
+        }
+    }
+  }
+  printf("No more free inodes\n!");
+  free(buffer);
+  return 0;
+}
+
+int balloc(int dev) {
+    int i, gno=0;
+    char *buffer;
+    i=BLKSIZE(sp);
+    buffer=malloc(i+1);
+    for(gno=0;gno<(int)((sp->s_inodes_count)/(sp->s_inodes_per_group));gno++) {
+        get_block(dev, BMAP(gp), buffer);
+
+        for (i=0; i < BLOCKS_PER_GRP(sp); i++) {
+            if (!TST_BIT(buffer,i)) {
+                SET_BIT(buffer, i);
+                decFreeBlocks(dev, gno);
+                put_block(dev, BMAP(gp), buffer);
+                FREE_1(buffer);
+                return i+1;
+            }
+        }
+    }
+    printf("No free blocks to allocate!\n");
+    free(buffer);
+    return 0;
+}
+idealloc(int dev, int ino) {
+    int i, gno;
+    char *buffer;
+    if (ino<=0) {
+        printf("idealloc: invalid inode\n");
+        return;
+    }
+    i=BLKSIZE(sp);
+    buffer=malloc(i+1);
+
+    gno=(ino-1)/INODES_PER_GRP(sp);
+    get_block(dev, IMAP(gp), buffer);
+    i=ino-1;
+    if (TST_BIT(buffer, i)) {
+        CLR_BIT(buffer, i);
+        incFreeInodes(dev, gno);
+        put_block(dev, IMAP(gp), buffer);
+    }
+    FREE_1(buffer);
+    return;
+}
+
+bdealloc(int dev, int bno) {
+    int i, gno=0;
+    char *buffer;
+    if (bno<=0) {
+        printf("bdealloc: invalid block address\n");
+        return;
+    }
+    i=BLKSIZE(sp);
+    buffer=malloc(i+1);
+
+    gno=(bno-1)/BLOCKS_PER_GRP(sp);
+    get_block(dev, BMAP(gp), buffer);
+    i=bno-1;
+    if (TST_BIT(buffer, i)) {
+        CLR_BIT(buffer, i);
+        incFreeBlocks(dev, gno);
+        put_block(dev, BMAP(gp), buffer);
+    }
+    free(buffer);
+    return;
+}
+inode(int fd, int ino) {
+ int grp, gino;
+ char buf[1024];
+ if (ino<sp->s_inodes_per_group) {
+    grp=0;
+    gino=ino-1;
+ } else {
+    grp=(int)((ino-1)/sp->s_inodes_per_group);
+    gino=(ino-1)%sp->s_inodes_per_group;
+ }
+ lseek64(fd, (long long)gp->bg_inode_table*BLKSIZE(sp)+(long long)gino*INODESIZE(sp), 0);
+ read(fd, buf, sizeof(INODE));
+ ip=(INODE *)buf;
+}
+write_inode(int fd, int ino, char *buf) {
+    int grp, gino;
+    grp=(ino-1)/INODES_PER_GRP(sp);
+    gino=(ino-1)%INODES_PER_GRP(sp);
+
+    lseek64(fd, (long long)INODE_TABLE(gp)*BLKSIZE(sp)+gino*INODESIZE(sp), 0);
+    write(fd, buf, sizeof(INODE));
+}
+
+int search(MINODE *mip, char *pname) {
+
+    int i,j,fd,m,ino;
+    char *buffer, *indirect;
+    int *blkno;
+
+    i=BLKSIZE(sp);
+    buffer=(char *)malloc(i+1);
+    indirect=(char *)malloc(i+1);
+
+    fd = mip->dev;
+    if (!S_ISDIR(mip->inode.i_mode))
+        return 0;
+
+    for (i=0;i<12;i++) {
+        get_block(mip->dev, mip->inode.i_block[i], buffer);
+        dp = (DIR *)buffer;
+        cp = buffer;
+
+        while(cp<buffer+BLKSIZE(sp) && dp->rec_len>0) {
+            if (strncmp(pname, dp->name, strlen(pname))==0) 
+                if(strlen(pname)==dp->name_len) {
+                        ino=dp->inode;
+                        free(buffer);
+                        free(indirect);
+                        return ino;
+                }
+            cp+=dp->rec_len;
+            dp=(DIR *)cp;
+        }
+    }
+
+    if (mip->inode.i_block[12]==0) {
+        free(buffer);
+        free(indirect);
+        return 0;
+    }
+
+    get_block(mip->dev, mip->inode.i_block[12], buffer);
+    for (i=0;i<BLKSIZE(sp)/4;i++) {
+        blkno=(int *)buffer+i;
+        if (*blkno==0)
+            break;
+        get_block(mip->dev, *blkno, indirect);
+        dp=(DIR *)indirect;
+        cp = indirect;
+        while (cp<indirect+BLKSIZE(sp) && dp->rec_len>0) {
+            if (strncmp(dp->name, pname, strlen(pname))==0)
+                if(strlen(pname)==dp->name_len) {
+                    ino=dp->inode;
+                    free(buffer);
+                    free(indirect);
+                    return ino;
+                }
+            cp+=dp->rec_len;
+            dp=(DIR *)cp;
+        }
+    }
+    free(buffer);
+    free(indirect);
+    return 0;
+}
+
+MINODE *iget(int dev, int ino) {
+
+    int i;
+    INODE *it;
+
+    for (i=0;i<NMINODES;i++) {
+        if (minode[i].dev==0)
+            continue;
+        if (minode[i].dev==dev && minode[i].ino==ino) {
+            minode[i].refCount+=1;
+            return(minode+i);
+        } else if (minode[i].refCount==0) {
+            minode[i].dev=dev;
+            minode[i].ino=ino;
+            minode[i].mounted=false;
+            inoded(dev, ino, &minode[i].inode);
+            minode[i].refCount+=1;
+            return(minode+i);
+        }
+    }
+
+    printf("memory full!! try later?\n");
+    return 0;
+
+}
+
+int iput(MINODE *mip) {
+
+    mip->refCount-=1;
+    if (mip->refCount>0 || mip->dirty==0)
+        return;
+    if (mip->dirty==1) {
+        write_inode(mip->dev, mip->ino, (char *)&(mip->inode));
+        mip->dirty=0;
+    }
+    return;
+}
+
+print_inode(INODE *inop) {
+
+    //print permission
+    //size
+    //links
+    //uid
+    //gid
+    //size
+    //time
+
+}
+int getino(int *dev, char *pathname) {
+
+    MINODE *mip;
+    MOUNT *mptr;
+    char cwd[1024];
+    char *names[64], *mount_name;
+    int i,j,inumber,count=0, pino, ino;
+
+    if (pathname[0]!='/') {
+        mip=iget(*dev, running->cwd->ino);
+        strcpy(cwd, "/");
+        strcat(cwd, pathname);
+    } else {
+        mip=iget(root->dev, root->ino);
+        strcpy(cwd, pathname);
+    }
+    names[count]=(char *)strtok(&cwd[1], "/");
+    while(names[count++]!=NULL) 
+        names[count]=(char *)strtok(NULL, "/");
+
+    for (i=0;i<count-1;i++) {
+        inumber = search(mip, names[i]);
+        if (inumber==0) {
+            iput(mip);
+            return 0;
+        }
+        if (strcmp(names[i], "..")==0) {
+            if (inumber==2 && search(mip, ".")==2 && mip->dev!=root->dev) {
+                for(j=0;j<NMOUNT;j++) {
+                    if (mount[j].dev==0)
+                        continue;
+                    if (mount[j].dev==*dev) {
+                        *dev=root->dev;
+                        mount_name=dirname(strdup(mount[j].path_name));
+                        inumber=search(root, mount_name);
+                        break;
+                    }
+                }
+                superb(root->dev);
+                group(root->dev, 0);
+            }
+        }
+        iput(mip);
+        mip=iget(*dev, inumber);
+        if (mip!=root && mip->mounted==true) {
+            for (j=0;j<NMOUNT;j++) {
+                if (mount[j].dev==0)
+                    continue;
+                if (strcmp(mount[j].path_name, names[i])==0) {
+                    *dev = mount[j].dev;
+                    inumber = 2;
+                    mip=iget(*dev, inumber);
+                    break;
+                }
+
+            }
+            superb(*dev);
+            group(*dev, 0);
+        } 
+    }        
+    
+    iput(mip);
+    return inumber;
+}
+
+int findmyname(MINODE *parent, int myino, char *myname) {
+    
+    int i,j;
+    char *buf, *indirect;
+    int *blkno;
+    INODE *inode = &(parent->inode);
+
+    if (!S_ISDIR(inode->i_mode))
+        return 0;
+    i=BLKSIZE(sp);
+    buf=(char *)malloc(i+1);
+    indirect=(char *)malloc(i+1);
+ 
+    for (i=0;i<12;i++) {
+        get_block(parent->dev, inode->i_block[i], buf);
+        dp = (DIR *)buf;
+        cp = buf;
+
+        while(cp<buf+BLKSIZE(sp) && dp->rec_len>0) {
+            if(!(strncmp(dp->name, ".", 1)==0 || strncmp(dp->name, "..", 2)==0) && dp->inode==myino) {
+                strncpy(myname, dp->name, dp->name_len);
+                FREE_2(buf, indirect);
+                return;
+            }
+            cp+=dp->rec_len;
+            dp=(DIR *)cp;
+        }
+    }
+    if(inode->i_block[12]==0) {
+        FREE_2(buf, indirect);
+        return 0;
+    }
+    get_block(parent->dev, inode->i_block[12], buf);
+    for (i=0;i<BLKSIZE(sp)/4;i++) {
+        blkno=(int *)buf+i;
+        if (*blkno==0)
+            break;
+        get_block(parent->dev, *blkno, indirect);
+        dp=(DIR *)indirect;
+        cp = indirect;
+        while (cp<indirect+BLKSIZE(sp) && dp->rec_len>0) {
+            if (dp->inode==myino) {
+                strncpy(myname, dp->name,  dp->name_len);
+                FREE_2(buf, indirect);
+                return;
+            }
+            cp+=dp->rec_len;
+            dp=(DIR *)cp;
+        }
+    }
+    FREE_2(buf, indirect);
+    return 0;
+}
+
+int findino (MINODE *mip, int *myino, int *parentino) {
+    *myino=search(mip, ".");
+    *parentino=search(mip, "..");
+    return 0;
+}
