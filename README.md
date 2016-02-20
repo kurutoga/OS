@@ -6,7 +6,7 @@
 - Most of the code inspiration from Dr. K.C. Wang.
 
 
-Included commands:
+Includes code for the following programs:
 
  cd       - change directory
  
