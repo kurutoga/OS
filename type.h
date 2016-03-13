@@ -1,4 +1,3 @@
-/* type.h file for CS360 FS */
 
 #include <stdio.h>
 #include <fcntl.h>
